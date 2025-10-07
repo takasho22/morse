@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Morse P2P (WebRTC + WebAudio) — Text/Morse selectable</title>
+<title>Morse P2P (WebRTC + WebAudio) — Text/Morse selectable + decode toggle</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; line-height: 1.5; }
   h1 { margin-top: 0; }
@@ -75,7 +75,10 @@
 <fieldset>
   <legend>4) 受信ビュー</legend>
   <div class="rx-panel">
-    <div><strong>記号列（.-）</strong></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+      <div><strong>記号列（.-）</strong></div>
+      <label class="small"><input id="toggleDecode" type="checkbox" checked> 復号テキストを表示</label>
+    </div>
     <div id="rxMorse" class="mono"></div>
     <div style="margin-top:8px;"><strong>復号テキスト</strong></div>
     <div id="rxText" class="mono"></div>
@@ -164,12 +167,7 @@ async function playMorseFromText(text, freq, unitMs) {
   }
 }
 
-/* ===== モールス入力モード：記号列そのまま再生 =====
-   ルール：
-   - '.' と '-' は符号。連続したものは1文字内の符号列（符号内間隔のみ）
-   - 半角スペースは文字間
-   - '/' は語間
-*/
+/* ===== モールス入力モード：記号列そのまま再生 ===== */
 function normalizeMorse(raw) {
   return raw.replace(/\s+/g, ' ').trim();
 }
@@ -240,13 +238,21 @@ function bindDataChannel() {
         const rxMorse = document.getElementById('rxMorse');
         const rxText  = document.getElementById('rxText');
         rxMorse.textContent = msg.tokens;
-        // mode=text のときは確実に復号
-        // mode=morse のときも、スペースや / があれば復号できる（"..": 単一トークンなので I）
-        rxText.textContent = morseToTextBySpaces(msg.tokens);
+
+        // 復号表示切替
+        const show = document.getElementById('toggleDecode').checked;
+        rxText.textContent = show ? morseToTextBySpaces(msg.tokens) : '';
       }
     } catch {}
   };
 }
+
+// 復号表示トグル時、即座に表示を反映（直前の記号列を再解釈）
+document.getElementById('toggleDecode').addEventListener('change', () => {
+  const show = document.getElementById('toggleDecode').checked;
+  const rxMorse = document.getElementById('rxMorse').textContent || '';
+  document.getElementById('rxText').textContent = show ? morseToTextBySpaces(rxMorse) : '';
+});
 
 /* ===== Caller: Offer ===== */
 document.getElementById('btnCreateOffer').addEventListener('click', async () => {
@@ -297,12 +303,10 @@ document.getElementById('btnSend').addEventListener('click', async () => {
 
   try {
     if (mode === 'morse') {
-      // そのまま記号列を再生して送る
       await playMorseFromTokens(text, freq, unitMs);
       const tokens = normalizeMorse(text);
       sendMorsePayload(tokens);
     } else {
-      // テキストをモールスへ
       await playMorseFromText(text, freq, unitMs);
       const tokens = textToMorse(text).replace(/\s{2,}/g, ' / ');
       sendMorsePayload(tokens);
