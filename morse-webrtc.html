@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Morse P2P (WebRTC + WebAudio) — Auto Raw</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; line-height: 1.5; }
+  h1 { margin-top: 0; }
+  fieldset { border: 1px solid #ccc; padding: 12px; margin-bottom: 16px; }
+  legend { padding: 0 6px; }
+  label { display: inline-block; margin: 4px 0; }
+  textarea, input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; }
+  button { padding: 8px 12px; cursor: pointer; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+  .rx-panel { background: #f7f7f9; border: 1px dashed #ccc; padding: 10px; border-radius: 6px; }
+  .small { font-size: 12px; color: #666; }
+</style>
+</head>
+<body>
+<h1>Morse P2P（ブラウザ↔ブラウザ）</h1>
+
+<fieldset>
+  <legend>1) 設定</legend>
+  <div class="row">
+    <div>
+      <label>周波数(Hz)
+        <input id="freq" type="number" value="800" min="100" max="5000" step="10">
+      </label>
+    </div>
+    <div>
+      <label>単位長(ms)（ドット長）
+        <input id="unit" type="number" value="60" min="20" max="300" step="5">
+      </label>
+    </div>
+  </div>
+  <label><input id="monitor" type="checkbox"> ローカル再生（自分のブラウザでも音を鳴らす）</label>
+</fieldset>
+
+<fieldset>
+  <legend>2) 接続（サーバ不要・コピペ式）</legend>
+  <div class="row">
+    <div>
+      <h3>Caller</h3>
+      <button id="btnCreateOffer">Offer を作る</button>
+      <textarea id="offerSdp" rows="8" placeholder="生成されたOfferがここに出ます"></textarea>
+      <button id="btnSetAnswer">相手の Answer を貼り付けて適用</button>
+      <textarea id="answerFromPeer" rows="8" placeholder="相手が返してきたAnswerを貼る"></textarea>
+    </div>
+    <div>
+      <h3>Answerer</h3>
+      <textarea id="offerFromPeer" rows="8" placeholder="相手のOfferをここに貼る"></textarea>
+      <button id="btnCreateAnswer">Answer を作って相手へ渡す</button>
+      <textarea id="answerSdp" rows="8" placeholder="生成されたAnswerがここに出ます"></textarea>
+    </div>
+  </div>
+  <p class="small">P2Pが通らない回線では失敗することがあります。その場合は後でTURN追加版にできます。</p>
+</fieldset>
+
+<fieldset>
+  <legend>3) 送信</legend>
+  <input id="msg" type="text" placeholder="Raw: . - / とスペースのみ → そのまま送信。その他は通常テキスト→モールス変換" />
+  <div style="margin-top:8px;">
+    <button id="btnSend">送信</button>
+    <span id="txStatus" class="small"></span>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>4) 受信ビュー</legend>
+  <div class="rx-panel">
+    <div><strong>記号列（.-）</strong></div>
+    <div id="rxMorse" class="mono"></div>
+    <div style="margin-top:8px;"><strong>復号テキスト</strong> <span class="small">(Rawは自動復号しません)</span></div>
+    <div id="rxText" class="mono"></div>
+  </div>
+</fieldset>
+
+<script>
+/* ===== モールステーブル ===== */
+const MORSE = {
+  'A': '.-',   'B': '-...', 'C': '-.-.', 'D': '-..',  'E': '.',
+  'F': '..-.', 'G': '--.',  'H': '....', 'I': '..',   'J': '.---',
+  'K': '-.-',  'L': '.-..', 'M': '--',   'N': '-.',   'O': '---',
+  'P': '.--.', 'Q': '--.-', 'R': '.-.',  'S': '...',  'T': '-',
+  'U': '..-',  'V': '...-', 'W': '.--',  'X': '-..-', 'Y': '-.--',
+  'Z': '--..',
+  '0': '-----', '1': '.----', '2': '..---', '3': '...--',
+  '4': '....-', '5': '.....', '6': '-....', '7': '--...',
+  '8': '---..', '9': '----.',
+  '.': '.-.-.-', ',': '--..--', '?': '..--..', '/': '-..-.',
+  '-': '-....-', '(': '-.--.', ')': '-.--.-', ' ': ' '
+};
+const MORSE_REV = {};
+Object.entries(MORSE).forEach(([k,v]) => { if(k !== ' ') MORSE_REV[v] = k; });
+
+/* ===== WebAudio 準備 ===== */
+let audioCtx = null;
+let dest = null;
+let outGain = null;
+let monitorGain = null;
+
+function ensureAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  dest = audioCtx.createMediaStreamDestination();
+  outGain = audioCtx.createGain();
+  outGain.gain.value = 1.0;
+  monitorGain = audioCtx.createGain();
+  monitorGain.gain.value = document.getElementById('monitor').checked ? 1.0 : 0.0;
+
+  outGain.connect(dest);
+  outGain.connect(monitorGain);
+  monitorGain.connect(audioCtx.destination);
+}
+
+document.getElementById('monitor').addEventListener('change', (e) => {
+  if (!audioCtx) return;
+  monitorGain.gain.value = e.target.checked ? 1.0 : 0.0;
+});
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function beep(duration, freq) {
+  ensureAudio();
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(0.0, now);
+  g.gain.linearRampToValueAtTime(0.3, now + 0.005);
+  g.gain.setValueAtTime(0.3, now + Math.max(0, duration - 0.010));
+  g.gain.linearRampToValueAtTime(0.0, now + Math.max(0.008, duration));
+  osc.connect(g).connect(outGain);
+  osc.start();
+  osc.stop(now + duration);
+  await sleep(duration * 1000);
+}
+
+/* ===== 通常モード：テキスト→モールス再生 ===== */
+function textToMorse(text) {
+  return text.toUpperCase().split('').map(ch => MORSE[ch] ?? '').join(' ');
+}
+async function playMorseFromText(text, freq, unitMs) {
+  const unit = unitMs / 1000;
+  const dot = unit, dash = 3*unit, intra = unit, interChar = 3*unit, interWord = 7*unit;
+  const seq = text.toUpperCase().split('').map(ch => MORSE[ch] ?? '');
+  for (let i = 0; i < seq.length; i++) {
+    const code = seq[i];
+    if (code === ' ') { await sleep(interWord*1000); continue; }
+    for (let j = 0; j < code.length; j++) {
+      const sym = code[j];
+      await beep(sym === '.' ? dot : dash, freq);
+      if (j < code.length - 1) await sleep(intra*1000);
+    }
+    if (i < seq.length - 1 && seq[i+1] !== ' ') await sleep(interChar*1000);
+  }
+}
+
+/* ===== Rawモード：入力記号をそのまま再生 =====
+   ルール：
+   - '.' と '-' は符号。連続したものは1文字内の符号列（符号内間隔のみ）
+   - 半角スペースは文字間
+   - '/' は語間
+*/
+function normalizeRaw(raw) {
+  return raw.replace(/\s+/g, ' ').trim();
+}
+async function playMorseFromRaw(raw, freq, unitMs) {
+  const unit = unitMs / 1000;
+  const dot = unit, dash = 3*unit, intra = unit, interChar = 3*unit, interWord = 7*unit;
+  const tokens = [];
+  const s = normalizeRaw(raw);
+  if (!s) return;
+  for (const part of s.split(' ')) {
+    if (!part) continue;
+    if (part === '/') { tokens.push('/'); continue; }
+    tokens.push(part); // 例: "...", ".-"
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === '/') { await sleep(interWord*1000); continue; }
+    for (let j = 0; j < t.length; j++) {
+      const sym = t[j];
+      if (sym !== '.' && sym !== '-') continue;
+      await beep(sym === '.' ? dot : dash, freq);
+      if (j < t.length - 1) await sleep(intra*1000); // 符号内のみ
+    }
+    if (i < tokens.length - 1 && tokens[i+1] !== '/') {
+      await sleep(interChar*1000); // 文字間だけ
+    }
+  }
+}
+
+/* ===== 受信側表示 ===== */
+function morseToTextBySpaces(morseStr) {
+  return morseStr.split(/\s+/).map(tok => {
+    if (tok === '/') return ' ';
+    if (!tok) return '';
+    return MORSE_REV[tok] ?? '';
+  }).join('');
+}
+
+/* ===== WebRTC ===== */
+let pc = null;
+let dataChannel = null;
+
+function createPeer() {
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }]
+  });
+  ensureAudio();
+  const track = dest.stream.getAudioTracks()[0];
+  pc.addTrack(track, dest.stream);
+
+  pc.ondatachannel = ev => { dataChannel = ev.channel; bindDataChannel(); };
+  pc.onconnectionstatechange = () => {
+    document.getElementById('txStatus').textContent = 'Connection: ' + pc.connectionState;
+  };
+}
+
+function bindDataChannel() {
+  dataChannel.onopen = () => {
+    document.getElementById('txStatus').textContent = 'DataChannel open';
+  };
+  dataChannel.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'morse') {
+        const rxMorse = document.getElementById('rxMorse');
+        const rxText  = document.getElementById('rxText');
+        rxMorse.textContent = msg.tokens; // そのまま表示
+        // Rawのときは自動復号しない（hasSepでもしない）
+        if (msg.mode === 'raw') {
+          rxText.textContent = '';
+        } else {
+          rxText.textContent = morseToTextBySpaces(msg.tokens);
+        }
+      }
+    } catch {}
+  };
+}
+
+/* ===== Caller: Offer ===== */
+document.getElementById('btnCreateOffer').addEventListener('click', async () => {
+  createPeer();
+  dataChannel = pc.createDataChannel('morse');
+  bindDataChannel();
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const f = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', f); res(); } };
+    pc.addEventListener('icegatheringstatechange', f);
+  });
+  document.getElementById('offerSdp').value = JSON.stringify(pc.localDescription);
+});
+
+/* ===== Caller: Set Answer ===== */
+document.getElementById('btnSetAnswer').addEventListener('click', async () => {
+  const s = document.getElementById('answerFromPeer').value.trim();
+  if (!s) return;
+  await pc.setRemoteDescription(JSON.parse(s));
+});
+
+/* ===== Answerer: Create Answer ===== */
+document.getElementById('btnCreateAnswer').addEventListener('click', async () => {
+  const s = document.getElementById('offerFromPeer').value.trim();
+  if (!s) return;
+  createPeer();
+  await pc.setRemoteDescription(JSON.parse(s));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const f = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', f); res(); } };
+    pc.addEventListener('icegatheringstatechange', f);
+  });
+  document.getElementById('answerSdp').value = JSON.stringify(pc.localDescription);
+});
+
+/* ===== 送信ボタン ===== */
+document.getElementById('btnSend').addEventListener('click', async () => {
+  const text = (document.getElementById('msg').value || '').trim();
+  if (!text) return;
+
+  const freq   = parseFloat(document.getElementById('freq').value) || 800;
+  const unitMs = parseInt(document.getElementById('unit').value, 10) || 60;
+
+  // 入力が .-/スペースのみなら自動Raw
+  const isRaw = /^[.\-\/\s]+$/.test(text);
+
+  try {
+    if (isRaw) {
+      await playMorseFromRaw(text, freq, unitMs);
+      const tokens = normalizeRaw(text);
+      sendMorsePayload({ mode: 'raw', tokens });
+    } else {
+      await playMorseFromText(text, freq, unitMs);
+      // 通常は文字間をスペース、語間を "/" として渡す
+      const tokens = textToMorse(text).replace(/\s{2,}/g, ' / ');
+      sendMorsePayload({ mode: 'text', tokens });
+    }
+    document.getElementById('txStatus').textContent = 'Sent';
+  } catch (e) {
+    console.error(e);
+    document.getElementById('txStatus').textContent = 'Send error';
+  }
+});
+
+function sendMorsePayload({ mode, tokens }) {
+  if (dataChannel && dataChannel.readyState === 'open') {
+    dataChannel.send(JSON.stringify({ type: 'morse', mode, tokens }));
+  }
+}
+</script>
+</body>
+</html>
