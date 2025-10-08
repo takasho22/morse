@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Morse P2P (WebRTC + WebAudio) — Text/Morse selectable + decode toggle</title>
+<title>Morse P2P (WebRTC + WebAudio) — Log export</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; line-height: 1.5; }
   h1 { margin-top: 0; }
@@ -17,6 +17,7 @@
   .rx-panel { background: #f7f7f9; border: 1px dashed #ccc; padding: 10px; border-radius: 6px; }
   .small { font-size: 12px; color: #666; }
   .mode { display: flex; gap: 16px; align-items: center; margin: 8px 0; }
+  .rx-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -73,11 +74,14 @@
 </fieldset>
 
 <fieldset>
-  <legend>4) 受信ビュー</legend>
+  <legend>4) 受信ビュー ＋ ログ出力</legend>
   <div class="rx-panel">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+    <div class="rx-toolbar">
       <div><strong>記号列（.-）</strong></div>
       <label class="small"><input id="toggleDecode" type="checkbox" checked> 復号テキストを表示</label>
+      <label class="small"><input id="includeDecodedInLog" type="checkbox" checked> 復号テキストをログに含める</label>
+      <button id="btnSaveLog" class="small">ログを保存(.txt)</button>
+      <button id="btnClearLog" class="small">ログをクリア</button>
     </div>
     <div id="rxMorse" class="mono"></div>
     <div style="margin-top:8px;"><strong>復号テキスト</strong></div>
@@ -180,7 +184,7 @@ async function playMorseFromTokens(raw, freq, unitMs) {
   for (const part of s.split(' ')) {
     if (!part) continue;
     if (part === '/') { tokens.push('/'); continue; }
-    tokens.push(part); // 例: "..", ".-"
+    tokens.push(part);
   }
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
@@ -208,6 +212,62 @@ function morseToTextBySpaces(morseStr) {
   }
   return out.join('');
 }
+
+/* ===== ログ機能 ===== */
+const convLog = [];  // {ts, dir, mode, tokens, decoded}
+function tsNow() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+function appendLog(entry) {
+  convLog.push(entry);
+}
+function buildTextLog(includeDecoded) {
+  const header = [
+    '# Morse P2P conversation log',
+    '# time, dir(TX|RX), mode(text|morse|unknown), tokens(.- and /), decoded(optional)',
+    ''
+  ].join('\n');
+  const lines = convLog.map(e => {
+    const base = `${e.ts}\t${e.dir}\t${e.mode || 'unknown'}\t${e.tokens}`;
+    if (includeDecoded) {
+      return `${base}\t${e.decoded || ''}`;
+    }
+    return base;
+  });
+  return header + lines.join('\n') + '\n';
+}
+function saveTextFile(filename, text) {
+  const blob = new Blob([text], {type: 'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('btnSaveLog').addEventListener('click', () => {
+  const includeDecoded = document.getElementById('includeDecodedInLog').checked;
+  const content = buildTextLog(includeDecoded);
+  const dt = new Date();
+  const fname = `morse_log_${dt.getFullYear()}${String(dt.getMonth()+1).padStart(2,'0')}${String(dt.getDate()).padStart(2,'0')}_${String(dt.getHours()).padStart(2,'0')}${String(dt.getMinutes()).padStart(2,'0')}${String(dt.getSeconds()).padStart(2,'0')}.txt`;
+  saveTextFile(fname, content);
+});
+document.getElementById('btnClearLog').addEventListener('click', () => {
+  convLog.length = 0;
+  // 画面表示は残す。完全クリアしたい場合は下を有効化
+  // document.getElementById('rxMorse').textContent = '';
+  // document.getElementById('rxText').textContent = '';
+});
 
 /* ===== WebRTC ===== */
 let pc = null;
@@ -237,21 +297,31 @@ function bindDataChannel() {
       if (msg.type === 'morse') {
         const rxMorse = document.getElementById('rxMorse');
         const rxText  = document.getElementById('rxText');
+
         rxMorse.textContent = msg.tokens;
 
-        // 復号表示切替
         const show = document.getElementById('toggleDecode').checked;
-        rxText.textContent = show ? morseToTextBySpaces(msg.tokens) : '';
+        const decoded = morseToTextBySpaces(msg.tokens);
+        rxText.textContent = show ? decoded : '';
+
+        appendLog({
+          ts: tsNow(),
+          dir: 'RX',
+          mode: msg.mode || 'unknown',
+          tokens: msg.tokens,
+          decoded: decoded
+        });
       }
     } catch {}
   };
 }
 
-// 復号表示トグル時、即座に表示を反映（直前の記号列を再解釈）
+// 復号表示トグル
 document.getElementById('toggleDecode').addEventListener('change', () => {
   const show = document.getElementById('toggleDecode').checked;
   const rxMorse = document.getElementById('rxMorse').textContent || '';
-  document.getElementById('rxText').textContent = show ? morseToTextBySpaces(rxMorse) : '';
+  const decoded = morseToTextBySpaces(rxMorse);
+  document.getElementById('rxText').textContent = show ? decoded : '';
 });
 
 /* ===== Caller: Offer ===== */
@@ -302,27 +372,35 @@ document.getElementById('btnSend').addEventListener('click', async () => {
   const mode   = document.querySelector('input[name="mode"]:checked').value;
 
   try {
+    let tokens = '';
     if (mode === 'morse') {
       await playMorseFromTokens(text, freq, unitMs);
-      const tokens = normalizeMorse(text);
-      sendMorsePayload(tokens);
+      tokens = normalizeMorse(text);
     } else {
       await playMorseFromText(text, freq, unitMs);
-      const tokens = textToMorse(text).replace(/\s{2,}/g, ' / ');
-      sendMorsePayload(tokens);
+      tokens = textToMorse(text).replace(/\s{2,}/g, ' / ');
     }
+
+    // 送信（データチャネル）
+    if (dataChannel && dataChannel.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'morse', mode, tokens }));
+    }
+
+    // ログにTXを追加（decodedはモールス→テキストの統一処理）
+    appendLog({
+      ts: tsNow(),
+      dir: 'TX',
+      mode,
+      tokens,
+      decoded: morseToTextBySpaces(tokens)
+    });
+
     document.getElementById('txStatus').textContent = 'Sent';
   } catch (e) {
     console.error(e);
     document.getElementById('txStatus').textContent = 'Send error';
   }
 });
-
-function sendMorsePayload(tokens) {
-  if (dataChannel && dataChannel.readyState === 'open') {
-    dataChannel.send(JSON.stringify({ type: 'morse', tokens }));
-  }
-}
 </script>
 </body>
 </html>
